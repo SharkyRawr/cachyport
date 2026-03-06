@@ -21,15 +21,25 @@ jobs:
           fetch-depth: 0
 
       - name: Install build dependencies
-        run: >-
+        run: |
+          set -euo pipefail
+          pacman-key --init
+          pacman-key --populate archlinux
           pacman -Syu --noconfirm
-          git
-          base-devel
-          python
-          python-build
-          python-installer
-          python-wheel
-          python-setuptools
+          pacman -S --needed --noconfirm \
+            git \
+            base-devel \
+            python \
+            python-build \
+            python-installer \
+            python-wheel \
+            python-setuptools
+
+      - name: Create non-root build user
+        run: |
+          set -euo pipefail
+          useradd --create-home --uid 1001 builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
 
       - name: Build package
         id: build
@@ -37,11 +47,29 @@ jobs:
           CACHYPORT_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cd build
-          makepkg --syncdeps --cleanbuild --noconfirm
-          pkg_file="$(ls -1 ./*.pkg.tar.* | grep -v '\.sig$' | head -n1)"
-          sha256sum "$pkg_file" > SHA256SUMS
-          sha512sum "$pkg_file" > SHA512SUMS
+          runuser -u builder -- env \
+            CACHYPORT_TAG="$CACHYPORT_TAG" \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            bash -lc '
+            set -euo pipefail
+            cd "$GITHUB_WORKSPACE/build"
+            CACHYPORT_TAG="$CACHYPORT_TAG" makepkg --cleanbuild --noconfirm
+            shopt -s nullglob
+            pkg_files=()
+            for file in ./*.pkg.tar.*; do
+              [[ "$file" == *.sig ]] && continue
+              pkg_files+=("$file")
+            done
+            if (( ${#pkg_files[@]} == 0 )); then
+              echo "No package artifact was produced" >&2
+              exit 1
+            fi
+            pkg_file="${pkg_files[0]}"
+            sha256sum "$pkg_file" > SHA256SUMS
+            sha512sum "$pkg_file" > SHA512SUMS
+            echo "${pkg_file#./}" > .package_name
+          '
+          pkg_file="$(cat build/.package_name)"
           {
             echo "package_file=${pkg_file#./}"
             echo "sha256_file=SHA256SUMS"
@@ -56,6 +84,11 @@ jobs:
             echo "## cachyport ${GITHUB_REF_NAME}"
             echo
             echo "Native Arch Linux package built from tag ${GITHUB_REF_NAME}."
+            echo
+            echo "### Artifacts"
+            echo "- \\`${{ steps.build.outputs.package_file }}\\`"
+            echo "- \\`${{ steps.build.outputs.sha256_file }}\\`"
+            echo "- \\`${{ steps.build.outputs.sha512_file }}\\`"
             echo
             echo "### SHA256"
             echo '```text'
@@ -72,6 +105,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          append_body: false
+          overwrite_files: true
+          generate_release_notes: true
           body_path: build/RELEASE_NOTES.md
           files: |
             build/${{ steps.build.outputs.package_file }}

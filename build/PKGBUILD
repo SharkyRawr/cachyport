@@ -11,18 +11,43 @@ makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools
 source=("${pkgname}-${_tag}.tar.gz::https://github.com/SharkyRawr/cachyport/archive/refs/tags/${_tag}.tar.gz")
 sha256sums=('SKIP')
 
+_source_tree() {
+  local candidate
+  for candidate in "${srcdir}"/cachyport-* "${srcdir}"/SharkyRawr-cachyport-*; do
+    [[ -d "${candidate}" ]] || continue
+    printf '%s\n' "${candidate}"
+    return 0
+  done
+  return 1
+}
+
 prepare() {
-  cd "${srcdir}/${pkgname}-${_tag}"
+  local src_tree
+  src_tree="$(_source_tree)" || {
+    echo "Unable to locate extracted source tree in ${srcdir}" >&2
+    return 1
+  }
+  cd "${src_tree}"
   sed -i -E "s/^version = \".*\"$/version = \"${pkgver}\"/" pyproject.toml
 }
 
 build() {
-  cd "${srcdir}/${pkgname}-${_tag}"
+  local src_tree
+  src_tree="$(_source_tree)" || {
+    echo "Unable to locate extracted source tree in ${srcdir}" >&2
+    return 1
+  }
+  cd "${src_tree}"
   python -m build --wheel --no-isolation
 }
 
 package() {
-  cd "${srcdir}/${pkgname}-${_tag}"
+  local src_tree
+  src_tree="$(_source_tree)" || {
+    echo "Unable to locate extracted source tree in ${srcdir}" >&2
+    return 1
+  }
+  cd "${src_tree}"
   python -m installer --destdir="${pkgdir}" dist/*.whl
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

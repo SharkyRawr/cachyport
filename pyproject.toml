@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Backport and manage CachyOS kernel packages on Arch Linux"
 readme = "README.md"
 requires-python = ">=3.14"
-license = { text = "CC-BY-NC-SA-4.0" }
+license = "CC-BY-NC-SA-4.0"
+license-files = ["LICENSE"]
 authors = [{ name = "cachyport" }]
 dependencies = []
 
@@ -21,7 +22,6 @@ cachyport = "cachyport.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
