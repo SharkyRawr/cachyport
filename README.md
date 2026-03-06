@@ -3,6 +3,9 @@
 `cachyport` is a Python CLI to fetch CachyOS kernel packages, port their package
 metadata for Arch compatibility, and install them locally.
 
+It intentionally does not support general/system package porting. Cross-distribution
+system package installs can introduce ABI and dependency breakage.
+
 It focuses on CachyOS kernel packages from the CachyOS binary repos and keeps
 index fetches cached for one day to keep repeated commands fast.
 
@@ -43,8 +46,9 @@ uv run cachyport --update
 
 - `--list` list available CachyOS kernel packages.
 - `--list --installed` list only installed CachyOS kernel packages.
-- `--install <pkg...>` port and install one or more packages.
+- `--install <pkg...>` port and install one or more kernel-family packages (`linux-cachyos*`).
 - `--update` check installed CachyOS kernel packages and only install when upstream is newer.
+  - includes installed `linux-cachyos*` packages and tracked kernel-family packages previously installed via `cachyport --install`.
 - `--doctor` run preflight checks (required tools, repo/arch mapping, mirror index access).
 
 ### Useful flags
@@ -82,10 +86,15 @@ Use `--refresh` to rebuild cache immediately.
 - Repacking removes upstream `.MTREE` from the local ported package to avoid stale integrity metadata after arch rewrite.
 - After install/update, `cachyport` ensures `/boot/<pkgbase>.kver` exists for installed kernel packages.
 - Index and downloads use mirror failover automatically (`--mirror` first, then built-in fallbacks).
+- Mirror fallback order adapts using local success/failure and latency history.
 - Package signatures are verified using detached `.sig` files and `pacman-key --verify` by default.
 
 ## Troubleshooting
 
 - Signature verification failures usually mean the CachyOS keyring is not installed/trusted on the host.
+- Typical fix path:
+  1. install/import CachyOS keyring on the host,
+  2. locally sign trusted keys (`pacman-key --lsign-key <keyid>`),
+  3. rerun `cachyport --doctor`.
 - If you understand the trust implications and need to continue, use `--skip-signature-check`.
 - Use `--doctor` to quickly validate environment setup and mirror/repo reachability.

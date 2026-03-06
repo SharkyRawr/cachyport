@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 
 DEFAULT_REPO = "cachyos-v3"
@@ -62,7 +62,6 @@ ANSI_RED = "\033[31m"
 ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
-PKG_LINK_RE = re.compile(r'href="([^"]+\.pkg\.tar\.(?:zst|xz))"')
 
 
 @dataclass
@@ -127,10 +126,69 @@ def tracked_packages_file() -> Path:
     return ensure_cache_dirs()["root"] / "tracked-packages.json"
 
 
+def mirror_stats_file() -> Path:
+    return ensure_cache_dirs()["root"] / "mirror-stats.json"
+
+
 def clear_local_cache() -> None:
     cache_root = user_cache_dir()
     if cache_root.exists():
         shutil.rmtree(cache_root)
+
+
+def load_mirror_stats() -> dict[str, dict[str, float]]:
+    path = mirror_stats_file()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, dict[str, float]] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        normalized[key] = {
+            "ok": float(value.get("ok", 0.0)),
+            "fail": float(value.get("fail", 0.0)),
+            "latency_ms": float(value.get("latency_ms", 0.0)),
+        }
+    return normalized
+
+
+def save_mirror_stats(stats: dict[str, dict[str, float]]) -> None:
+    mirror_stats_file().write_text(json.dumps(stats, indent=2, sort_keys=True))
+
+
+def mirror_root_from_url(url: str) -> str:
+    parsed = urlsplit(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if "repo" in parts:
+        repo_index = parts.index("repo")
+        root_path = "/" + "/".join(parts[: repo_index + 1])
+    elif parts:
+        root_path = "/" + parts[0]
+    else:
+        root_path = ""
+    return f"{parsed.scheme}://{parsed.netloc}{root_path}"
+
+
+def record_mirror_result(url: str, success: bool, latency_ms: float) -> None:
+    root = mirror_root_from_url(url)
+    stats = load_mirror_stats()
+    entry = stats.get(root, {"ok": 0.0, "fail": 0.0, "latency_ms": 0.0})
+    if success:
+        entry["ok"] = entry.get("ok", 0.0) + 1
+        current = entry.get("latency_ms", 0.0)
+        entry["latency_ms"] = (
+            latency_ms if current <= 0 else ((current * 0.7) + (latency_ms * 0.3))
+        )
+    else:
+        entry["fail"] = entry.get("fail", 0.0) + 1
+    stats[root] = entry
+    save_mirror_stats(stats)
 
 
 def load_tracked_packages() -> set[str]:
@@ -181,7 +239,23 @@ def candidate_mirrors(primary: str) -> list[str]:
             continue
         seen.add(value)
         normalized.append(value)
-    return normalized
+
+    primary_normalized = primary.rstrip("/")
+    others = [value for value in normalized if value != primary_normalized]
+    stats = load_mirror_stats()
+
+    def mirror_score(mirror: str) -> tuple[float, float, str]:
+        entry = stats.get(mirror, {})
+        ok = float(entry.get("ok", 0.0))
+        fail = float(entry.get("fail", 0.0))
+        latency = float(entry.get("latency_ms", 0.0)) or 999999.0
+        reliability = ok - (fail * 2.0)
+        return (-reliability, latency, mirror)
+
+    others_sorted = sorted(others, key=mirror_score)
+    if primary_normalized in normalized:
+        return [primary_normalized, *others_sorted]
+    return others_sorted
 
 
 def run_command(
@@ -195,29 +269,6 @@ def run_command(
             f"command failed ({proc.returncode}): {shell_join(command)}{extra}"
         )
     return proc
-
-
-def fetch_text(url: str) -> str:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "cachyport/0.1 (+https://github.com)",
-            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
-        },
-    )
-    try:
-        with urlopen(req, timeout=30) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except HTTPError, URLError:
-        curl = subprocess.run(
-            ["curl", "-fsSL", "-A", "cachyport/0.1", url],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if curl.returncode != 0:
-            raise RuntimeError(f"failed to fetch {url}: {curl.stderr.strip()}")
-        return curl.stdout
 
 
 def download_file(url: str, dest: Path) -> None:
@@ -243,11 +294,14 @@ def download_file_with_failover(urls: list[str], dest: Path) -> str:
     errors: list[str] = []
     for url in urls:
         dest.unlink(missing_ok=True)
+        started = time.perf_counter()
         try:
             download_file(url, dest)
+            record_mirror_result(url, True, (time.perf_counter() - started) * 1000.0)
             return url
         except RuntimeError as exc:
             dest.unlink(missing_ok=True)
+            record_mirror_result(url, False, (time.perf_counter() - started) * 1000.0)
             errors.append(str(exc))
     raise RuntimeError("all mirrors failed: " + " | ".join(errors))
 
@@ -265,35 +319,6 @@ def verify_package_signature(package_path: Path, signature_path: Path) -> None:
             "--skip-signature-check to bypass. "
             f"Details: {exc}"
         ) from exc
-
-
-def parse_directory_packages(html: str, base_url: str) -> list[PackageRecord]:
-    seen: set[str] = set()
-    records: list[PackageRecord] = []
-
-    for match in PKG_LINK_RE.findall(html):
-        filename = match.split("/")[-1]
-        if filename in seen:
-            continue
-        seen.add(filename)
-
-        stem = filename.split(".pkg.tar.")[0]
-        parts = stem.rsplit("-", 3)
-        if len(parts) != 4:
-            continue
-        name, pkgver, pkgrel, _arch = parts
-        records.append(
-            PackageRecord(
-                name=name,
-                version=f"{pkgver}-{pkgrel}",
-                filename=filename,
-                url=urljoin(
-                    base_url if base_url.endswith("/") else f"{base_url}/", filename
-                ),
-            )
-        )
-
-    return records
 
 
 def parse_repo_db_desc(content: str) -> dict[str, str]:
@@ -374,11 +399,16 @@ def load_index(
 
         with tempfile.TemporaryDirectory(prefix="cachyport-db-") as tmp:
             db_path = Path(tmp) / f"{repo}.db"
+            started = time.perf_counter()
             try:
                 download_file(db_url, db_path)
             except RuntimeError as exc:
+                record_mirror_result(
+                    db_url, False, (time.perf_counter() - started) * 1000.0
+                )
                 errors.append(str(exc))
                 continue
+            record_mirror_result(db_url, True, (time.perf_counter() - started) * 1000.0)
 
             try:
                 packages = parse_repo_db(db_path, repo_url)
@@ -403,6 +433,21 @@ def load_index(
     }
     index_file.write_text(json.dumps(payload, indent=2))
     return packages
+
+
+def verify_repo_index_signature(repo: str, arch: str, mirror: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="cachyport-db-verify-") as tmp:
+        db_path = Path(tmp) / f"{repo}.db"
+        sig_path = Path(tmp) / f"{repo}.db.sig"
+        db_urls = [
+            f"{mirror_root}/{arch}/{repo}/{repo}.db"
+            for mirror_root in candidate_mirrors(mirror)
+        ]
+        used = download_file_with_failover(db_urls, db_path)
+        sig_urls = [f"{url}.sig" for url in db_urls]
+        download_file_with_failover(sig_urls, sig_path)
+        verify_package_signature(db_path, sig_path)
+        return used
 
 
 def normalize_variant(name: str) -> str:
@@ -653,7 +698,16 @@ def resolve_requested_names(
             resolved.append(normalized)
             continue
         raise RuntimeError(f"requested package not found in repo: {name}")
-    return sorted(set(resolved))
+
+    unique = sorted(set(resolved))
+    unsupported = [item for item in unique if not item.startswith("linux-cachyos")]
+    if unsupported:
+        raise RuntimeError(
+            "unsupported package selection: "
+            + ", ".join(unsupported)
+            + ". cachyport only supports CachyOS kernel packages (linux-cachyos*)."
+        )
+    return unique
 
 
 def prepare_packages_for_install(
@@ -829,6 +883,8 @@ def handle_doctor(args: argparse.Namespace, color_enabled: bool) -> int:
 
     validate_repo_arch(args.repo, args.arch)
     load_index(args.repo, args.arch, args.mirror, True, args.cache_ttl)
+    used_mirror = verify_repo_index_signature(args.repo, args.arch, args.mirror)
+    print_success(f"Verified repo index signature via {used_mirror}", color_enabled)
 
     print_success("Doctor checks passed", color_enabled)
     return 0
@@ -910,7 +966,8 @@ def handle_update(args: argparse.Namespace, color_enabled: bool) -> int:
 
     if not update_targets:
         print_success(
-            "No updates available for installed CachyOS kernel packages", color_enabled
+            "No updates available for installed CachyOS kernel packages",
+            color_enabled,
         )
         return 0
 
@@ -965,8 +1022,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cachyport",
         description=(
-            "Download CachyOS kernel packages, port architecture metadata to Arch-compatible "
-            "x86_64, and install updates locally."
+            "Download CachyOS kernel packages (linux-cachyos*), port architecture "
+            "metadata to Arch-compatible x86_64, and install updates locally."
         ),
     )
 
@@ -975,7 +1032,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--list", action="store_true", help="List available CachyOS kernel packages"
     )
     action.add_argument(
-        "--install", nargs="+", metavar="PKG", help="Port and install package(s)"
+        "--install",
+        nargs="+",
+        metavar="PKG",
+        help="Port and install kernel-family package(s) (linux-cachyos*)",
     )
     action.add_argument(
         "--update", action="store_true", help="Update installed CachyOS kernel packages"
