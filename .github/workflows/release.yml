@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: >-
+          pacman -Syu --noconfirm
+          git
+          base-devel
+          python
+          python-build
+          python-installer
+          python-wheel
+          python-setuptools
+
+      - name: Build package
+        id: build
+        env:
+          CACHYPORT_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd build
+          makepkg --syncdeps --cleanbuild --noconfirm
+          pkg_file="$(ls -1 ./*.pkg.tar.* | grep -v '\.sig$' | head -n1)"
+          sha256sum "$pkg_file" > SHA256SUMS
+          sha512sum "$pkg_file" > SHA512SUMS
+          {
+            echo "package_file=${pkg_file#./}"
+            echo "sha256_file=SHA256SUMS"
+            echo "sha512_file=SHA512SUMS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release notes
+        run: |
+          set -euo pipefail
+          cd build
+          {
+            echo "## cachyport ${GITHUB_REF_NAME}"
+            echo
+            echo "Native Arch Linux package built from tag ${GITHUB_REF_NAME}."
+            echo
+            echo "### SHA256"
+            echo '```text'
+            cat SHA256SUMS
+            echo '```'
+            echo
+            echo "### SHA512"
+            echo '```text'
+            cat SHA512SUMS
+            echo '```'
+          } > RELEASE_NOTES.md
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: build/RELEASE_NOTES.md
+          files: |
+            build/${{ steps.build.outputs.package_file }}
+            build/${{ steps.build.outputs.sha256_file }}
+            build/${{ steps.build.outputs.sha512_file }}

@@ -1,35 +1,41 @@
 # cachyport
 
-`cachyport` is a Python CLI to fetch CachyOS kernel packages, port their package
-metadata for Arch compatibility, and install them locally.
+`cachyport` is a command-line tool for Arch Linux users who want to install
+CachyOS kernel packages by porting package metadata to an Arch-compatible form.
 
-It intentionally does not support general/system package porting. Cross-distribution
-system package installs can introduce ABI and dependency breakage.
+Repository: https://github.com/SharkyRawr/cachyport
 
-The single exception is `cachyos-keyring`, which can be installed via
-`--bootstrap-keyring` to enable signature verification.
+License: CC-BY-NC-SA 4.0
 
-It focuses on CachyOS kernel packages from the CachyOS binary repos and keeps
-index fetches cached for one day to keep repeated commands fast.
+## Scope and Safety
 
-## What it does
+`cachyport` is intentionally focused on the CachyOS kernel family
+(`linux-cachyos*`). It does **not** support general system package porting,
+because cross-distribution system packages can introduce ABI and dependency
+breakage.
 
-- Downloads upstream CachyOS `.pkg.tar.*` kernel packages.
-- Ports architecture metadata (`x86_64_v3` / `x86_64_v4` -> `x86_64`) so Arch can install them.
-- Preserves package metadata semantics (depends/provides/conflicts/etc.) from upstream.
-- Installs packages via `pacman -U`.
-- Highlights package names in yellow, errors in red, and success in green.
+The only non-kernel exception is `cachyos-keyring`, provided via
+`--bootstrap-keyring` so signature verification can be enabled.
 
-Uninstall remains the normal Arch workflow: `pacman -R ...`
+## Features
+
+- Lists available CachyOS kernel packages.
+- Downloads upstream CachyOS kernel binaries.
+- Rewrites architecture metadata (`x86_64_v3` / `x86_64_v4` to `x86_64`).
+- Verifies semantic metadata parity after repacking.
+- Verifies detached signatures by default (`pacman-key --verify`).
+- Supports mirror failover with local reliability/latency scoring.
+- Caches repository indexes for 24 hours.
+- Installs via `pacman -U` and repairs missing `/boot/*.kver` files.
 
 ## Requirements
 
-- Linux with `pacman`
+- Arch Linux (or compatible system with `pacman`)
 - Python 3.14+
 - `uv`
-- `curl` (used as fallback for some mirror fetch/download cases)
+- `curl`
 
-## Setup
+## Development Setup
 
 ```bash
 uv sync
@@ -37,70 +43,78 @@ uv sync
 
 ## Usage
 
-Run through `uv`:
-
 ```bash
 uv run cachyport --list
 uv run cachyport --install linux-cachyos
 uv run cachyport --update
 ```
 
-### Commands
+### Core Commands
 
-- `--list` list available CachyOS kernel packages.
-- `--list --installed` list only installed CachyOS kernel packages.
-- `--install <pkg...>` port and install one or more kernel-family packages (`linux-cachyos*`).
-- `--update` check installed CachyOS kernel packages and only install when upstream is newer.
-  - includes installed `linux-cachyos*` packages and tracked kernel-family packages previously installed via `cachyport --install`.
-- `--doctor` run preflight checks (required tools, repo/arch mapping, mirror index access).
-- `--bootstrap-keyring` install `cachyos-keyring` so detached signature checks can succeed (auto-finds a repo that provides it).
+- `--list`: list available CachyOS kernel packages.
+- `--list --installed`: only show installed kernel packages.
+- `--install <pkg...>`: install kernel-family packages (`linux-cachyos*`).
+- `--update`: update installed kernel-family packages when upstream is newer.
+- `--bootstrap-keyring`: install `cachyos-keyring` to enable trust setup.
+- `--doctor`: run preflight checks (tools, repo access, signature path).
+- `--clean`: clear local cache (`~/.cache/cachyport`).
 
-### Useful flags
+### Common Flags
 
-- `--refresh` force refresh repo index cache and redownload packages.
-- `--download-only` perform download + porting without running `pacman -U`.
-- `--force` with `--install`/`--update`/`--bootstrap-keyring` bypasses cached downloads and backported packages.
-- `--dry-run` with `--install`/`--update`/`--bootstrap-keyring` prints planned actions without changing files or packages.
-- `--strict-audit` with `--install`/`--update` compares additional package metadata fields during repack validation.
-- `--skip-signature-check` with `--install`/`--update` bypasses detached signature verification.
-- `--allow-unsigned-keyring` with `--bootstrap-keyring` bypasses signature check for keyring bootstrap only.
-- `--clean` removes local `cachyport` cache data (`~/.cache/cachyport`).
-- `--assume-yes` pass `--noconfirm` to `pacman`.
-- `--no-color` disable ANSI colors.
-- `--repo`, `--arch`, `--mirror` override source settings.
-  - repos: `cachyos`, `cachyos-v3`, `cachyos-v4`, `cachyos-znver4`
-  - arches: `x86_64`, `x86_64_v3`, `x86_64_v4`
+- `--refresh`: refresh index/download cache.
+- `--force`: bypass cached downloads/backports.
+- `--download-only`: skip `pacman -U`.
+- `--dry-run`: print planned actions only.
+- `--strict-audit`: compare additional metadata fields after repack.
+- `--skip-signature-check`: skip package signature verification for install/update.
+- `--allow-unsigned-keyring`: allow unsigned keyring bootstrap only.
+- `--assume-yes`: pass `--noconfirm` to pacman.
 
-## Cache behavior
+## Cache Locations
 
-- Index cache location: `~/.cache/cachyport/index/`
-- Download cache location: `~/.cache/cachyport/downloads/`
-- Repacked package location: `~/.cache/cachyport/backported/`
-- Default index cache TTL: 24 hours
+- Index cache: `~/.cache/cachyport/index/`
+- Download cache: `~/.cache/cachyport/downloads/`
+- Backported packages: `~/.cache/cachyport/backported/`
+- Tracked package state: `~/.cache/cachyport/tracked-packages.json`
+- Mirror stats: `~/.cache/cachyport/mirror-stats.json`
 
-Use `--refresh` to rebuild cache immediately.
+## Packaging for Arch Linux
 
-## Notes
+Native Arch packaging files are provided in `build/`.
 
-- Installation requires root because `pacman -U` is run with `sudo`.
-- Package updates are determined by comparing installed versions with repo versions via `vercmp`.
-- `--update` checks installed `linux-cachyos*` packages and packages previously installed via `cachyport --install`.
-- Repo/arch combinations are validated (`cachyos->x86_64`, `cachyos-v3->x86_64_v3`, `cachyos-v4->x86_64_v4`, `cachyos-znver4->x86_64_v4`).
-- Repacked packages are verified with `pacman -Qip` to ensure semantic fields (depends/provides/conflicts/replaces/optional deps) are unchanged.
-- `--strict-audit` extends repack validation to extra fields (description, URL, licenses, groups, packager, build date, install script).
-- Repacking removes upstream `.MTREE` from the local ported package to avoid stale integrity metadata after arch rewrite.
-- After install/update, `cachyport` ensures `/boot/<pkgbase>.kver` exists for installed kernel packages.
-- Index and downloads use mirror failover automatically (`--mirror` first, then built-in fallbacks).
-- Mirror fallback order adapts using local success/failure and latency history.
-- Package signatures are verified using detached `.sig` files and `pacman-key --verify` by default.
+```bash
+cd build
+export CACHYPORT_TAG=v0.1.0
+makepkg --syncdeps --cleanbuild
+```
+
+`PKGBUILD` derives `pkgver` from the current git tag (`CACHYPORT_TAG`),
+removing a leading `v` when present.
+
+## Release Automation
+
+On tag push, GitHub Actions will:
+
+1. Build the native Arch package from `build/PKGBUILD`.
+2. Generate SHA256 and SHA512 checksum files.
+3. Create a GitHub Release and upload:
+   - the built package
+   - `SHA256SUMS`
+   - `SHA512SUMS`
+4. Publish checksums in the release notes for verification.
+
+Workflow file: `.github/workflows/release.yml`
 
 ## Troubleshooting
 
-- Signature verification failures usually mean the CachyOS keyring is not installed/trusted on the host.
-- Run `uv run cachyport --bootstrap-keyring` to install keyring support first.
-- Typical fix path:
-  1. install/import CachyOS keyring on the host,
-  2. locally sign trusted keys (`pacman-key --lsign-key <keyid>`),
-  3. rerun `cachyport --doctor`.
-- If you understand the trust implications and need to continue, use `--skip-signature-check`.
-- Use `--doctor` to quickly validate environment setup and mirror/repo reachability.
+- Signature failures usually mean the CachyOS signing keys are not installed or
+  trusted in your pacman keyring.
+- Start with:
+
+  ```bash
+  uv run cachyport --bootstrap-keyring
+  uv run cachyport --doctor
+  ```
+
+- If you accept the trust tradeoff for first bootstrap, use
+  `--allow-unsigned-keyring` with `--bootstrap-keyring`.

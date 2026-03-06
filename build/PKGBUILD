@@ -1,0 +1,28 @@
+pkgname=cachyport
+_tag="${CACHYPORT_TAG:-$(git -C "${startdir}/.." describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)}"
+pkgver="${_tag#v}"
+pkgrel=1
+pkgdesc="CachyOS kernel backport/install helper for Arch Linux"
+arch=('x86_64')
+url='https://github.com/SharkyRawr/cachyport'
+license=('custom:CC-BY-NC-SA-4.0')
+depends=('python' 'pacman' 'curl')
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools' 'git')
+source=("${pkgname}-${_tag}.tar.gz::https://github.com/SharkyRawr/cachyport/archive/refs/tags/${_tag}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${_tag}"
+  sed -i -E "s/^version = \".*\"$/version = \"${pkgver}\"/" pyproject.toml
+}
+
+build() {
+  cd "${srcdir}/${pkgname}-${_tag}"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${_tag}"
+  python -m installer --destdir="${pkgdir}" dist/*.whl
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
