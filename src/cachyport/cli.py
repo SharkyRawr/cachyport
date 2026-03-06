@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -23,6 +24,23 @@ DEFAULT_MIRROR = "https://mirror.cachyos.org/repo"
 CACHE_TTL_SECONDS = 24 * 60 * 60
 SUPPORTED_REPOS = ("cachyos", "cachyos-v3", "cachyos-v4", "cachyos-znver4")
 SUPPORTED_ARCHES = ("x86_64", "x86_64_v3", "x86_64_v4")
+REPO_ARCH_MAP = {
+    "cachyos": "x86_64",
+    "cachyos-v3": "x86_64_v3",
+    "cachyos-v4": "x86_64_v4",
+    "cachyos-znver4": "x86_64_v4",
+}
+SEMANTIC_PKG_FIELDS = (
+    "Name",
+    "Version",
+    "Depends On",
+    "Optional Deps",
+    "Provides",
+    "Conflicts With",
+    "Replaces",
+)
+PACKAGE_METADATA_FILES = {".PKGINFO", ".BUILDINFO"}
+PACKAGE_INTEGRITY_FILES = {".MTREE"}
 
 ANSI_RED = "\033[31m"
 ANSI_GREEN = "\033[32m"
@@ -87,6 +105,50 @@ def ensure_cache_dirs() -> dict[str, Path]:
         "downloads": downloads,
         "backported": backported,
     }
+
+
+def tracked_packages_file() -> Path:
+    return ensure_cache_dirs()["root"] / "tracked-packages.json"
+
+
+def clear_local_cache() -> None:
+    cache_root = user_cache_dir()
+    if cache_root.exists():
+        shutil.rmtree(cache_root)
+
+
+def load_tracked_packages() -> set[str]:
+    state_path = tracked_packages_file()
+    if not state_path.exists():
+        return set()
+    try:
+        payload = json.loads(state_path.read_text())
+    except Exception:
+        return set()
+
+    packages = payload.get("packages", [])
+    if not isinstance(packages, list):
+        return set()
+    return {item for item in packages if isinstance(item, str) and item}
+
+
+def save_tracked_packages(packages: set[str]) -> None:
+    state_path = tracked_packages_file()
+    state_path.write_text(json.dumps({"packages": sorted(packages)}, indent=2))
+
+
+def remember_tracked_packages(package_names: list[str]) -> None:
+    tracked = load_tracked_packages()
+    tracked.update(package_names)
+    save_tracked_packages(tracked)
+
+
+def validate_repo_arch(repo: str, arch: str) -> None:
+    expected = REPO_ARCH_MAP.get(repo)
+    if expected and arch != expected:
+        raise RuntimeError(
+            f"repo {repo} requires --arch {expected}, but got --arch {arch}"
+        )
 
 
 def shell_join(parts: list[str]) -> str:
@@ -180,6 +242,7 @@ def parse_directory_packages(html: str, base_url: str) -> list[PackageRecord]:
 def load_index(
     repo: str, arch: str, mirror: str, refresh: bool, cache_ttl: int
 ) -> list[PackageRecord]:
+    validate_repo_arch(repo, arch)
     dirs = ensure_cache_dirs()
     index_file = dirs["index"] / f"{repo}-{arch}.json"
 
@@ -243,18 +306,102 @@ def parse_pacman_q_output(output: str) -> dict[str, str]:
     return installed
 
 
-def get_installed_cachyos_package_versions() -> dict[str, str]:
-    proc = run_command(["pacman", "-Qq"], capture=True)
-    package_names = [
-        line.strip()
-        for line in proc.stdout.splitlines()
-        if line.strip().startswith("linux-cachyos")
-    ]
+def get_installed_versions_for_names(package_names: set[str]) -> dict[str, str]:
     if not package_names:
         return {}
-
-    details = run_command(["pacman", "-Q", *package_names], capture=True)
+    details = run_command(["pacman", "-Q", *sorted(package_names)], capture=True)
     return parse_pacman_q_output(details.stdout)
+
+
+def installed_package_name_set() -> set[str]:
+    proc = run_command(["pacman", "-Qq"], capture=True)
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def get_installed_cachyos_package_versions() -> dict[str, str]:
+    names = {
+        name
+        for name in installed_package_name_set()
+        if name.startswith("linux-cachyos")
+    }
+    return get_installed_versions_for_names(names)
+
+
+def get_installed_managed_package_versions(
+    available: dict[str, PackageRecord],
+) -> dict[str, str]:
+    installed_names = installed_package_name_set()
+    tracked = load_tracked_packages()
+    kernel_names = {
+        name for name in installed_names if name.startswith("linux-cachyos")
+    }
+    candidates = (kernel_names | tracked) & installed_names & set(available)
+    return get_installed_versions_for_names(candidates)
+
+
+def parse_pacman_qip_output(output: str) -> dict[str, str]:
+    info: dict[str, str] = {}
+    current_key: str | None = None
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        if ":" in line and not line.startswith(" "):
+            key, value = line.split(":", 1)
+            current_key = key.strip()
+            info[current_key] = value.strip()
+            continue
+        if current_key is None:
+            continue
+
+        value = line.strip()
+        if not value:
+            continue
+        existing = info.get(current_key, "")
+        info[current_key] = f"{existing}\n{value}" if existing else value
+    return info
+
+
+def package_info(path: Path) -> dict[str, str]:
+    proc = run_command(["pacman", "-Qip", str(path)], capture=True)
+    return parse_pacman_qip_output(proc.stdout)
+
+
+def normalize_field_value(value: str) -> str:
+    parts = [" ".join(line.split()) for line in value.splitlines() if line.strip()]
+    return "\n".join(parts)
+
+
+def validate_repacked_metadata(original_pkg: Path, repacked_pkg: Path) -> None:
+    if original_pkg == repacked_pkg:
+        return
+
+    original = package_info(original_pkg)
+    repacked = package_info(repacked_pkg)
+
+    source_arch = original.get("Architecture", "")
+    target_arch = repacked.get("Architecture", "")
+    if source_arch not in {"x86_64_v3", "x86_64_v4"}:
+        raise RuntimeError(
+            f"unexpected source package architecture in {original_pkg.name}: {source_arch}"
+        )
+    if target_arch != "x86_64":
+        raise RuntimeError(
+            f"repacked package architecture is {target_arch}, expected x86_64"
+        )
+
+    differences: list[str] = []
+    for field in SEMANTIC_PKG_FIELDS:
+        original_value = normalize_field_value(original.get(field, ""))
+        repacked_value = normalize_field_value(repacked.get(field, ""))
+        if original_value != repacked_value:
+            differences.append(field)
+
+    if differences:
+        fields = ", ".join(differences)
+        raise RuntimeError(
+            f"metadata mismatch after repack for {repacked_pkg.name}: {fields}"
+        )
 
 
 def compare_versions(new_version: str, old_version: str) -> int:
@@ -313,13 +460,16 @@ def repack_with_arch_port(downloaded_pkg: Path, output_dir: Path) -> Path:
         tarfile.open(out_path, mode=out_mode) as target,
     ):
         for member in source:
+            basename = Path(member.name).name
+            if basename in PACKAGE_INTEGRITY_FILES:
+                continue
+
             if member.isfile():
                 source_file = source.extractfile(member)
                 if source_file is None:
                     raise RuntimeError(f"failed to read member {member.name}")
                 with source_file:
-                    basename = Path(member.name).name
-                    if basename in {".PKGINFO", ".BUILDINFO"}:
+                    if basename in PACKAGE_METADATA_FILES:
                         raw = source_file.read()
                         rewritten = rewrite_metadata_contents(basename, raw)
                         new_member = copy.copy(member)
@@ -331,6 +481,23 @@ def repack_with_arch_port(downloaded_pkg: Path, output_dir: Path) -> Path:
                 target.addfile(member)
 
     return out_path
+
+
+def repack_with_arch_port_force(
+    downloaded_pkg: Path, output_dir: Path, force: bool
+) -> Path:
+    if not force:
+        return repack_with_arch_port(downloaded_pkg, output_dir)
+
+    stem, suffix = downloaded_pkg.name.split(".pkg.tar.", 1)
+    name, pkgver, pkgrel, arch = stem.rsplit("-", 3)
+    if arch not in {"x86_64_v3", "x86_64_v4"}:
+        return downloaded_pkg
+
+    out_name = f"{name}-{pkgver}-{pkgrel}-x86_64.pkg.tar.{suffix}"
+    out_path = output_dir / out_name
+    out_path.unlink(missing_ok=True)
+    return repack_with_arch_port(downloaded_pkg, output_dir)
 
 
 def resolve_requested_names(
@@ -353,6 +520,7 @@ def prepare_packages_for_install(
     package_names: list[str],
     available: dict[str, PackageRecord],
     refresh: bool,
+    force: bool,
     color_enabled: bool,
 ) -> list[Path]:
     dirs = ensure_cache_dirs()
@@ -361,11 +529,15 @@ def prepare_packages_for_install(
     for package_name in package_names:
         record = available[package_name]
         download_path = dirs["downloads"] / record.filename
-        if refresh or not download_path.exists():
+        if force:
+            download_path.unlink(missing_ok=True)
+
+        if force or refresh or not download_path.exists():
             print(f"Downloading {c_pkg(record.filename, color_enabled)}")
             download_file(record.url, download_path)
 
-        repacked = repack_with_arch_port(download_path, dirs["backported"])
+        repacked = repack_with_arch_port_force(download_path, dirs["backported"], force)
+        validate_repacked_metadata(download_path, repacked)
         local_paths.append(repacked)
         print_success(f"Ready {repacked.name}", color_enabled)
 
@@ -373,7 +545,10 @@ def prepare_packages_for_install(
 
 
 def install_local_packages(
-    paths: list[Path], assume_yes: bool, color_enabled: bool
+    paths: list[Path],
+    installed_names: list[str],
+    assume_yes: bool,
+    color_enabled: bool,
 ) -> None:
     cmd = ["sudo", "pacman", "-U"]
     if assume_yes:
@@ -381,7 +556,66 @@ def install_local_packages(
     cmd.extend(str(path) for path in paths)
     print(f"Running: {shell_join(cmd)}")
     run_command(cmd)
+    ensure_boot_kver_files(installed_names, color_enabled)
+    remember_tracked_packages(installed_names)
     print_success("Install complete", color_enabled)
+
+
+def package_file_list(package_name: str) -> list[Path]:
+    proc = run_command(["pacman", "-Qlq", package_name], capture=True)
+    return [Path(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
+
+
+def module_pkgbase_paths(package_name: str) -> list[Path]:
+    result: list[Path] = []
+    for path in package_file_list(package_name):
+        parts = path.parts
+        if len(parts) < 6:
+            continue
+        if parts[:4] != ("/", "usr", "lib", "modules"):
+            continue
+        if path.name != "pkgbase":
+            continue
+        result.append(path)
+    return result
+
+
+def ensure_boot_kver_files(package_names: list[str], color_enabled: bool) -> None:
+    updates: list[str] = []
+    for package_name in package_names:
+        for pkgbase_path in module_pkgbase_paths(package_name):
+            try:
+                pkgbase = pkgbase_path.read_text().strip()
+            except OSError:
+                continue
+            if not pkgbase:
+                continue
+
+            kernel_release = pkgbase_path.parent.name
+            boot_kver = Path("/boot") / f"{pkgbase}.kver"
+            desired = f"{kernel_release}\n"
+
+            current = None
+            try:
+                current = boot_kver.read_text()
+            except OSError:
+                pass
+
+            if current == desired:
+                continue
+
+            cmd = [
+                "sudo",
+                "sh",
+                "-c",
+                f"printf '%s' {shlex.quote(desired)} > {shlex.quote(str(boot_kver))}",
+            ]
+            run_command(cmd)
+            updates.append(boot_kver.name)
+
+    if updates:
+        joined = ", ".join(sorted(set(updates)))
+        print_success(f"Created/updated kver files: {joined}", color_enabled)
 
 
 def handle_list(args: argparse.Namespace, color_enabled: bool) -> int:
@@ -412,14 +646,14 @@ def handle_install(args: argparse.Namespace, color_enabled: bool) -> int:
 
     resolved = resolve_requested_names(args.install, available)
     paths = prepare_packages_for_install(
-        resolved, available, args.refresh, color_enabled
+        resolved, available, args.refresh, args.force, color_enabled
     )
 
     if args.download_only:
         print_success("Download/backport complete (skipped install)", color_enabled)
         return 0
 
-    install_local_packages(paths, args.assume_yes, color_enabled)
+    install_local_packages(paths, resolved, args.assume_yes, color_enabled)
     return 0
 
 
@@ -428,7 +662,7 @@ def handle_update(args: argparse.Namespace, color_enabled: bool) -> int:
         load_index(args.repo, args.arch, args.mirror, args.refresh, args.cache_ttl)
     )
     available = package_map(records)
-    installed = get_installed_cachyos_package_versions()
+    installed = get_installed_managed_package_versions(available)
 
     update_targets: list[str] = []
     skipped_not_newer = 0
@@ -462,7 +696,7 @@ def handle_update(args: argparse.Namespace, color_enabled: bool) -> int:
         )
 
     paths = prepare_packages_for_install(
-        sorted(update_targets), available, args.refresh, color_enabled
+        sorted(update_targets), available, args.refresh, args.force, color_enabled
     )
     if args.download_only:
         print_success(
@@ -470,7 +704,12 @@ def handle_update(args: argparse.Namespace, color_enabled: bool) -> int:
         )
         return 0
 
-    install_local_packages(paths, args.assume_yes, color_enabled)
+    install_local_packages(
+        paths,
+        sorted(update_targets),
+        args.assume_yes,
+        color_enabled,
+    )
     return 0
 
 
@@ -492,6 +731,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     action.add_argument(
         "--update", action="store_true", help="Update installed CachyOS kernel packages"
+    )
+    action.add_argument(
+        "--clean", action="store_true", help="Remove local cachyport cache data"
     )
 
     parser.add_argument(
@@ -539,6 +781,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download/repack but skip pacman -U",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --install/--update, bypass cached downloads and backported packages",
+    )
+    parser.add_argument(
         "--no-color", action="store_true", help="Disable colored output"
     )
 
@@ -557,6 +804,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_install(args, color_enabled)
         if args.update:
             return handle_update(args, color_enabled)
+        if args.clean:
+            clear_local_cache()
+            print_success("Removed local cache data", color_enabled)
+            return 0
         raise RuntimeError("no action selected")
     except KeyboardInterrupt:
         print_error("interrupted by user", color_enabled)

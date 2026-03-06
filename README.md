@@ -50,9 +50,13 @@ uv run cachyport --update
 
 - `--refresh` force refresh repo index cache and redownload packages.
 - `--download-only` perform download + porting without running `pacman -U`.
+- `--force` with `--install`/`--update` bypasses cached downloads and backported packages.
+- `--clean` removes local `cachyport` cache data (`~/.cache/cachyport`).
 - `--assume-yes` pass `--noconfirm` to `pacman`.
 - `--no-color` disable ANSI colors.
 - `--repo`, `--arch`, `--mirror` override source settings.
+  - repos: `cachyos`, `cachyos-v3`, `cachyos-v4`, `cachyos-znver4`
+  - arches: `x86_64`, `x86_64_v3`, `x86_64_v4`
 
 ## Cache behavior
 
@@ -67,3 +71,8 @@ Use `--refresh` to rebuild cache immediately.
 
 - Installation requires root because `pacman -U` is run with `sudo`.
 - Package updates are determined by comparing installed versions with repo versions via `vercmp`.
+- `--update` checks installed `linux-cachyos*` packages and packages previously installed via `cachyport --install`.
+- Repo/arch combinations are validated (`cachyos->x86_64`, `cachyos-v3->x86_64_v3`, `cachyos-v4->x86_64_v4`, `cachyos-znver4->x86_64_v4`).
+- Repacked packages are verified with `pacman -Qip` to ensure semantic fields (depends/provides/conflicts/replaces/optional deps) are unchanged.
+- Repacking removes upstream `.MTREE` from the local ported package to avoid stale integrity metadata after arch rewrite.
+- After install/update, `cachyport` ensures `/boot/<pkgbase>.kver` exists for installed kernel packages.
