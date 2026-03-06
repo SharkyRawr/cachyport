@@ -6,6 +6,9 @@ metadata for Arch compatibility, and install them locally.
 It intentionally does not support general/system package porting. Cross-distribution
 system package installs can introduce ABI and dependency breakage.
 
+The single exception is `cachyos-keyring`, which can be installed via
+`--bootstrap-keyring` to enable signature verification.
+
 It focuses on CachyOS kernel packages from the CachyOS binary repos and keeps
 index fetches cached for one day to keep repeated commands fast.
 
@@ -50,15 +53,17 @@ uv run cachyport --update
 - `--update` check installed CachyOS kernel packages and only install when upstream is newer.
   - includes installed `linux-cachyos*` packages and tracked kernel-family packages previously installed via `cachyport --install`.
 - `--doctor` run preflight checks (required tools, repo/arch mapping, mirror index access).
+- `--bootstrap-keyring` install `cachyos-keyring` so detached signature checks can succeed (auto-finds a repo that provides it).
 
 ### Useful flags
 
 - `--refresh` force refresh repo index cache and redownload packages.
 - `--download-only` perform download + porting without running `pacman -U`.
-- `--force` with `--install`/`--update` bypasses cached downloads and backported packages.
-- `--dry-run` with `--install`/`--update` prints planned actions without changing files or packages.
+- `--force` with `--install`/`--update`/`--bootstrap-keyring` bypasses cached downloads and backported packages.
+- `--dry-run` with `--install`/`--update`/`--bootstrap-keyring` prints planned actions without changing files or packages.
 - `--strict-audit` with `--install`/`--update` compares additional package metadata fields during repack validation.
 - `--skip-signature-check` with `--install`/`--update` bypasses detached signature verification.
+- `--allow-unsigned-keyring` with `--bootstrap-keyring` bypasses signature check for keyring bootstrap only.
 - `--clean` removes local `cachyport` cache data (`~/.cache/cachyport`).
 - `--assume-yes` pass `--noconfirm` to `pacman`.
 - `--no-color` disable ANSI colors.
@@ -92,6 +97,7 @@ Use `--refresh` to rebuild cache immediately.
 ## Troubleshooting
 
 - Signature verification failures usually mean the CachyOS keyring is not installed/trusted on the host.
+- Run `uv run cachyport --bootstrap-keyring` to install keyring support first.
 - Typical fix path:
   1. install/import CachyOS keyring on the host,
   2. locally sign trusted keys (`pacman-key --lsign-key <keyid>`),

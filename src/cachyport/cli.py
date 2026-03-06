@@ -37,6 +37,7 @@ REPO_ARCH_MAP = {
     "cachyos-v4": "x86_64_v4",
     "cachyos-znver4": "x86_64_v4",
 }
+KEYRING_PACKAGE = "cachyos-keyring"
 SEMANTIC_PKG_FIELDS = (
     "Name",
     "Version",
@@ -57,6 +58,8 @@ STRICT_AUDIT_PKG_FIELDS = (
 )
 PACKAGE_METADATA_FILES = {".PKGINFO", ".BUILDINFO"}
 PACKAGE_INTEGRITY_FILES = {".MTREE"}
+
+_MIRROR_STATS_CACHE: dict[str, dict[str, float]] | None = None
 
 ANSI_RED = "\033[31m"
 ANSI_GREEN = "\033[32m"
@@ -131,21 +134,30 @@ def mirror_stats_file() -> Path:
 
 
 def clear_local_cache() -> None:
+    global _MIRROR_STATS_CACHE
     cache_root = user_cache_dir()
     if cache_root.exists():
         shutil.rmtree(cache_root)
+    _MIRROR_STATS_CACHE = None
 
 
 def load_mirror_stats() -> dict[str, dict[str, float]]:
+    global _MIRROR_STATS_CACHE
+    if _MIRROR_STATS_CACHE is not None:
+        return _MIRROR_STATS_CACHE
+
     path = mirror_stats_file()
     if not path.exists():
-        return {}
+        _MIRROR_STATS_CACHE = {}
+        return _MIRROR_STATS_CACHE
     try:
         payload = json.loads(path.read_text())
     except Exception:
-        return {}
+        _MIRROR_STATS_CACHE = {}
+        return _MIRROR_STATS_CACHE
     if not isinstance(payload, dict):
-        return {}
+        _MIRROR_STATS_CACHE = {}
+        return _MIRROR_STATS_CACHE
     normalized: dict[str, dict[str, float]] = {}
     for key, value in payload.items():
         if not isinstance(key, str) or not isinstance(value, dict):
@@ -155,11 +167,14 @@ def load_mirror_stats() -> dict[str, dict[str, float]]:
             "fail": float(value.get("fail", 0.0)),
             "latency_ms": float(value.get("latency_ms", 0.0)),
         }
-    return normalized
+    _MIRROR_STATS_CACHE = normalized
+    return _MIRROR_STATS_CACHE
 
 
 def save_mirror_stats(stats: dict[str, dict[str, float]]) -> None:
+    global _MIRROR_STATS_CACHE
     mirror_stats_file().write_text(json.dumps(stats, indent=2, sort_keys=True))
+    _MIRROR_STATS_CACHE = stats
 
 
 def mirror_root_from_url(url: str) -> str:
@@ -203,7 +218,11 @@ def load_tracked_packages() -> set[str]:
     packages = payload.get("packages", [])
     if not isinstance(packages, list):
         return set()
-    return {item for item in packages if isinstance(item, str) and item}
+    return {
+        item
+        for item in packages
+        if isinstance(item, str) and item.startswith("linux-cachyos")
+    }
 
 
 def save_tracked_packages(packages: set[str]) -> None:
@@ -316,6 +335,7 @@ def verify_package_signature(package_path: Path, signature_path: Path) -> None:
         raise RuntimeError(
             "signature verification failed for "
             f"{package_path.name}. Install/trust CachyOS keyring or use "
+            "`cachyport --bootstrap-keyring` to install it first, or use "
             "--skip-signature-check to bypass. "
             f"Details: {exc}"
         ) from exc
@@ -439,10 +459,8 @@ def verify_repo_index_signature(repo: str, arch: str, mirror: str) -> str:
     with tempfile.TemporaryDirectory(prefix="cachyport-db-verify-") as tmp:
         db_path = Path(tmp) / f"{repo}.db"
         sig_path = Path(tmp) / f"{repo}.db.sig"
-        db_urls = [
-            f"{mirror_root}/{arch}/{repo}/{repo}.db"
-            for mirror_root in candidate_mirrors(mirror)
-        ]
+        mirrors = candidate_mirrors(mirror)
+        db_urls = [f"{mirror_root}/{arch}/{repo}/{repo}.db" for mirror_root in mirrors]
         used = download_file_with_failover(db_urls, db_path)
         sig_urls = [f"{url}.sig" for url in db_urls]
         download_file_with_failover(sig_urls, sig_path)
@@ -514,7 +532,8 @@ def get_installed_managed_package_versions(
     kernel_names = {
         name for name in installed_names if name.startswith("linux-cachyos")
     }
-    candidates = (kernel_names | tracked) & installed_names & set(available)
+    tracked_kernel = {name for name in tracked if name.startswith("linux-cachyos")}
+    candidates = (kernel_names | tracked_kernel) & installed_names & set(available)
     return get_installed_versions_for_names(candidates)
 
 
@@ -853,22 +872,34 @@ def validate_action_flags(args: argparse.Namespace) -> None:
     if not args.list and args.installed:
         raise RuntimeError("--installed can only be used with --list")
 
+    install_like = bool(args.install) or args.update or args.bootstrap_keyring
     install_update = bool(args.install) or args.update
-    if not install_update and args.assume_yes:
-        raise RuntimeError("--assume-yes can only be used with --install or --update")
-    if not install_update and args.download_only:
+
+    if not install_like and args.assume_yes:
         raise RuntimeError(
-            "--download-only can only be used with --install or --update"
+            "--assume-yes can only be used with --install, --update, or --bootstrap-keyring"
         )
-    if not install_update and args.force:
-        raise RuntimeError("--force can only be used with --install or --update")
-    if not install_update and args.dry_run:
-        raise RuntimeError("--dry-run can only be used with --install or --update")
+    if not install_like and args.download_only:
+        raise RuntimeError(
+            "--download-only can only be used with --install, --update, or --bootstrap-keyring"
+        )
+    if not install_like and args.force:
+        raise RuntimeError(
+            "--force can only be used with --install, --update, or --bootstrap-keyring"
+        )
+    if not install_like and args.dry_run:
+        raise RuntimeError(
+            "--dry-run can only be used with --install, --update, or --bootstrap-keyring"
+        )
     if not install_update and args.strict_audit:
         raise RuntimeError("--strict-audit can only be used with --install or --update")
     if not install_update and args.skip_signature_check:
         raise RuntimeError(
             "--skip-signature-check can only be used with --install or --update"
+        )
+    if not args.bootstrap_keyring and args.allow_unsigned_keyring:
+        raise RuntimeError(
+            "--allow-unsigned-keyring can only be used with --bootstrap-keyring"
         )
 
     if args.clean and args.refresh:
@@ -887,6 +918,95 @@ def handle_doctor(args: argparse.Namespace, color_enabled: bool) -> int:
     print_success(f"Verified repo index signature via {used_mirror}", color_enabled)
 
     print_success("Doctor checks passed", color_enabled)
+    return 0
+
+
+def handle_bootstrap_keyring(args: argparse.Namespace, color_enabled: bool) -> int:
+    repo_arch_candidates: list[tuple[str, str]] = []
+    requested = (args.repo, args.arch)
+    repo_arch_candidates.append(requested)
+    for repo_name in SUPPORTED_REPOS:
+        candidate = (repo_name, REPO_ARCH_MAP[repo_name])
+        if candidate not in repo_arch_candidates:
+            repo_arch_candidates.append(candidate)
+
+    record: PackageRecord | None = None
+    selected_repo, selected_arch = requested
+    for repo_name, arch_name in repo_arch_candidates:
+        records = load_index(
+            repo_name, arch_name, args.mirror, args.refresh, args.cache_ttl
+        )
+        available = package_map(records)
+        if KEYRING_PACKAGE in available:
+            record = available[KEYRING_PACKAGE]
+            selected_repo, selected_arch = repo_name, arch_name
+            break
+
+    if record is None:
+        raise RuntimeError(
+            f"{KEYRING_PACKAGE} was not found in supported CachyOS repos"
+        )
+
+    dirs = ensure_cache_dirs()
+    pkg_path = dirs["downloads"] / record.filename
+    urls = [
+        f"{mirror_root}/{selected_arch}/{selected_repo}/{record.filename}"
+        for mirror_root in candidate_mirrors(args.mirror)
+    ]
+
+    if args.dry_run:
+        print(
+            f"Would bootstrap {c_pkg(KEYRING_PACKAGE, color_enabled)} "
+            f"from {args.mirror}/{selected_arch}/{selected_repo}/"
+        )
+        if args.allow_unsigned_keyring:
+            print_success("Would skip keyring signature verification", color_enabled)
+        return 0
+
+    if args.force:
+        pkg_path.unlink(missing_ok=True)
+
+    if args.force or args.refresh or not pkg_path.exists():
+        print(f"Downloading {c_pkg(record.filename, color_enabled)}")
+        used = download_file_with_failover(urls, pkg_path)
+        if used != urls[0]:
+            print_success(f"Mirror failover succeeded via {used}", color_enabled)
+
+    if not args.allow_unsigned_keyring:
+        sig_path = pkg_path.with_name(f"{pkg_path.name}.sig")
+        if args.force:
+            sig_path.unlink(missing_ok=True)
+        if args.force or args.refresh or not sig_path.exists():
+            sig_urls = [f"{url}.sig" for url in urls]
+            print(f"Downloading signature for {c_pkg(record.filename, color_enabled)}")
+            used_sig = download_file_with_failover(sig_urls, sig_path)
+            if used_sig != sig_urls[0]:
+                print_success(
+                    f"Signature mirror failover succeeded via {used_sig}", color_enabled
+                )
+        verify_package_signature(pkg_path, sig_path)
+
+    if args.download_only:
+        print_success("Keyring downloaded (skipped install)", color_enabled)
+        return 0
+
+    cmd = ["sudo", "pacman", "-U"]
+    if args.assume_yes:
+        cmd.append("--noconfirm")
+    cmd.append(str(pkg_path))
+    print(f"Running: {shell_join(cmd)}")
+    run_command(cmd)
+
+    try:
+        run_command(["sudo", "pacman-key", "--populate", "cachyos"])
+        print_success("Populated CachyOS keyring in pacman", color_enabled)
+    except RuntimeError as exc:
+        print_error(
+            f"keyring installed but `pacman-key --populate cachyos` failed: {exc}",
+            color_enabled,
+        )
+
+    print_success("Keyring bootstrap complete", color_enabled)
     return 0
 
 
@@ -1048,6 +1168,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run preflight checks for tools, repo access, and configuration",
     )
+    action.add_argument(
+        "--bootstrap-keyring",
+        action="store_true",
+        help="Install CachyOS keyring package for signature verification support",
+    )
 
     parser.add_argument(
         "--installed",
@@ -1091,17 +1216,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--download-only",
         action="store_true",
-        help="Download/repack but skip pacman -U",
+        help="With install/update/bootstrap, download only and skip pacman -U",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="With --install/--update, bypass cached downloads and backported packages",
+        help="With install/update/bootstrap, bypass cached downloads/backports",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="With --install/--update, show planned actions without changes",
+        help="With install/update/bootstrap, show planned actions without changes",
     )
     parser.add_argument(
         "--strict-audit",
@@ -1112,6 +1237,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-signature-check",
         action="store_true",
         help="With --install/--update, skip detached signature verification",
+    )
+    parser.add_argument(
+        "--allow-unsigned-keyring",
+        action="store_true",
+        help="With --bootstrap-keyring, allow install without signature verification",
     )
     parser.add_argument(
         "--no-color", action="store_true", help="Disable colored output"
@@ -1139,6 +1269,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.doctor:
             return handle_doctor(args, color_enabled)
+        if args.bootstrap_keyring:
+            return handle_bootstrap_keyring(args, color_enabled)
         raise RuntimeError("no action selected")
     except KeyboardInterrupt:
         print_error("interrupted by user", color_enabled)
