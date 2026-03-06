@@ -76,6 +76,61 @@ jobs:
             echo "sha512_file=SHA512SUMS"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Generate changelog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+
+          def api(path: str, data: dict | None = None):
+              url = f"https://api.github.com{path}"
+              body = None
+              if data is not None:
+                  body = json.dumps(data).encode("utf-8")
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "cachyport-release-workflow",
+                  },
+                  method="POST" if data is not None else "GET",
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          tags = api(f"/repos/{repo}/tags?per_page=100")
+          previous = None
+          for item in tags:
+              name = item.get("name")
+              if name and name != tag:
+                  previous = name
+                  break
+
+          payload = {"tag_name": tag, "target_commitish": "main"}
+          if previous:
+              payload["previous_tag_name"] = previous
+
+          notes = api(f"/repos/{repo}/releases/generate-notes", payload)
+          body = notes.get("body", "").strip()
+          with open("build/CHANGELOG.md", "w", encoding="utf-8") as fh:
+              if body:
+                  fh.write(body + "\n")
+              else:
+                  fh.write("No notable changes were detected for this tag.\n")
+          PY
+
       - name: Create release notes
         run: |
           set -euo pipefail
@@ -85,10 +140,13 @@ jobs:
             echo
             echo "Native Arch Linux package built from tag ${GITHUB_REF_NAME}."
             echo
+            echo "### What's New"
+            cat CHANGELOG.md
+            echo
             echo "### Artifacts"
-            echo "- \\`${{ steps.build.outputs.package_file }}\\`"
-            echo "- \\`${{ steps.build.outputs.sha256_file }}\\`"
-            echo "- \\`${{ steps.build.outputs.sha512_file }}\\`"
+            echo "- `${{ steps.build.outputs.package_file }}`"
+            echo "- `${{ steps.build.outputs.sha256_file }}`"
+            echo "- `${{ steps.build.outputs.sha512_file }}`"
             echo
             echo "### SHA256"
             echo '```text'
@@ -107,7 +165,6 @@ jobs:
           tag_name: ${{ github.ref_name }}
           append_body: false
           overwrite_files: true
-          generate_release_notes: true
           body_path: build/RELEASE_NOTES.md
           files: |
             build/${{ steps.build.outputs.package_file }}
