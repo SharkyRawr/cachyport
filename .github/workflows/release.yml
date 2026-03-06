@@ -135,6 +135,14 @@ jobs:
         run: |
           set -euo pipefail
           cd build
+          pkg_file="$(awk 'NR==1 {print $2}' SHA256SUMS)"
+          pkg_file="${pkg_file#./}"
+          if [[ -z "${pkg_file}" ]]; then
+            echo "Failed to determine package artifact name from SHA256SUMS" >&2
+            exit 1
+          fi
+          sha256_file="SHA256SUMS"
+          sha512_file="SHA512SUMS"
           {
             echo "## cachyport ${GITHUB_REF_NAME}"
             echo
@@ -144,9 +152,9 @@ jobs:
             cat CHANGELOG.md
             echo
             echo "### Artifacts"
-            echo "- `${{ steps.build.outputs.package_file }}`"
-            echo "- `${{ steps.build.outputs.sha256_file }}`"
-            echo "- `${{ steps.build.outputs.sha512_file }}`"
+            printf -- '- `%s`\n' "${pkg_file}"
+            printf -- '- `%s`\n' "${sha256_file}"
+            printf -- '- `%s`\n' "${sha512_file}"
             echo
             echo "### SHA256"
             echo '```text'
