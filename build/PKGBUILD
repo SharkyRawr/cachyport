@@ -3,7 +3,7 @@ _tag="${CACHYPORT_TAG:-$(git -C "${startdir}/.." describe --tags --abbrev=0 2>/d
 pkgver="${_tag#v}"
 pkgrel=1
 pkgdesc="CachyOS kernel backport/install helper for Arch Linux"
-arch=('x86_64')
+arch=('any')
 url='https://github.com/SharkyRawr/cachyport'
 license=('custom:CC-BY-NC-SA-4.0')
 depends=('python' 'pacman' 'curl')
