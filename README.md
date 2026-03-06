@@ -45,6 +45,7 @@ uv run cachyport --update
 - `--list --installed` list only installed CachyOS kernel packages.
 - `--install <pkg...>` port and install one or more packages.
 - `--update` check installed CachyOS kernel packages and only install when upstream is newer.
+- `--doctor` run preflight checks (required tools, repo/arch mapping, mirror index access).
 
 ### Useful flags
 
@@ -53,6 +54,7 @@ uv run cachyport --update
 - `--force` with `--install`/`--update` bypasses cached downloads and backported packages.
 - `--dry-run` with `--install`/`--update` prints planned actions without changing files or packages.
 - `--strict-audit` with `--install`/`--update` compares additional package metadata fields during repack validation.
+- `--skip-signature-check` with `--install`/`--update` bypasses detached signature verification.
 - `--clean` removes local `cachyport` cache data (`~/.cache/cachyport`).
 - `--assume-yes` pass `--noconfirm` to `pacman`.
 - `--no-color` disable ANSI colors.
@@ -80,3 +82,10 @@ Use `--refresh` to rebuild cache immediately.
 - Repacking removes upstream `.MTREE` from the local ported package to avoid stale integrity metadata after arch rewrite.
 - After install/update, `cachyport` ensures `/boot/<pkgbase>.kver` exists for installed kernel packages.
 - Index and downloads use mirror failover automatically (`--mirror` first, then built-in fallbacks).
+- Package signatures are verified using detached `.sig` files and `pacman-key --verify` by default.
+
+## Troubleshooting
+
+- Signature verification failures usually mean the CachyOS keyring is not installed/trusted on the host.
+- If you understand the trust implications and need to continue, use `--skip-signature-check`.
+- Use `--doctor` to quickly validate environment setup and mirror/repo reachability.

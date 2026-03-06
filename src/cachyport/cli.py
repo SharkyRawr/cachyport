@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -251,6 +252,21 @@ def download_file_with_failover(urls: list[str], dest: Path) -> str:
     raise RuntimeError("all mirrors failed: " + " | ".join(errors))
 
 
+def verify_package_signature(package_path: Path, signature_path: Path) -> None:
+    try:
+        run_command(
+            ["pacman-key", "--verify", str(signature_path), str(package_path)],
+            capture=True,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "signature verification failed for "
+            f"{package_path.name}. Install/trust CachyOS keyring or use "
+            "--skip-signature-check to bypass. "
+            f"Details: {exc}"
+        ) from exc
+
+
 def parse_directory_packages(html: str, base_url: str) -> list[PackageRecord]:
     seen: set[str] = set()
     records: list[PackageRecord] = []
@@ -280,6 +296,60 @@ def parse_directory_packages(html: str, base_url: str) -> list[PackageRecord]:
     return records
 
 
+def parse_repo_db_desc(content: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    current: str | None = None
+    values: list[str] = []
+
+    def flush() -> None:
+        nonlocal current, values
+        if current is None:
+            return
+        fields[current] = "\n".join(values)
+        current = None
+        values = []
+
+    for raw in content.splitlines():
+        line = raw.strip("\n")
+        if line.startswith("%") and line.endswith("%") and len(line) > 2:
+            flush()
+            current = line.strip("%")
+            values = []
+            continue
+        values.append(line)
+    flush()
+    return fields
+
+
+def parse_repo_db(db_path: Path, base_url: str) -> list[PackageRecord]:
+    records: list[PackageRecord] = []
+    with tarfile.open(db_path, mode="r:*") as tf:
+        for member in tf.getmembers():
+            if not member.isfile() or not member.name.endswith("/desc"):
+                continue
+            fileobj = tf.extractfile(member)
+            if fileobj is None:
+                continue
+            text = fileobj.read().decode("utf-8", errors="replace")
+            fields = parse_repo_db_desc(text)
+            name = fields.get("NAME", "").strip()
+            version = fields.get("VERSION", "").strip()
+            filename = fields.get("FILENAME", "").strip()
+            if not name or not version or not filename:
+                continue
+            records.append(
+                PackageRecord(
+                    name=name,
+                    version=version,
+                    filename=filename,
+                    url=urljoin(
+                        base_url if base_url.endswith("/") else f"{base_url}/", filename
+                    ),
+                )
+            )
+    return records
+
+
 def load_index(
     repo: str, arch: str, mirror: str, refresh: bool, cache_ttl: int
 ) -> list[PackageRecord]:
@@ -300,16 +370,25 @@ def load_index(
     errors: list[str] = []
     for mirror_root in candidate_mirrors(mirror):
         repo_url = f"{mirror_root}/{arch}/{repo}/"
-        try:
-            html = fetch_text(repo_url)
-            packages = parse_directory_packages(html, repo_url)
-        except RuntimeError as exc:
-            errors.append(str(exc))
-            continue
+        db_url = f"{repo_url}{repo}.db"
+
+        with tempfile.TemporaryDirectory(prefix="cachyport-db-") as tmp:
+            db_path = Path(tmp) / f"{repo}.db"
+            try:
+                download_file(db_url, db_path)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+                continue
+
+            try:
+                packages = parse_repo_db(db_path, repo_url)
+            except (tarfile.TarError, OSError) as exc:
+                errors.append(f"failed to parse repo database {db_url}: {exc}")
+                continue
 
         if packages:
             break
-        errors.append(f"no packages found in repository index: {repo_url}")
+        errors.append(f"no packages found in repo database: {db_url}")
 
     if not packages:
         raise RuntimeError(
@@ -586,6 +665,7 @@ def prepare_packages_for_install(
     refresh: bool,
     force: bool,
     strict_audit: bool,
+    verify_signature: bool,
     dry_run: bool,
     color_enabled: bool,
 ) -> list[Path]:
@@ -595,6 +675,10 @@ def prepare_packages_for_install(
     for package_name in package_names:
         record = available[package_name]
         download_path = dirs["downloads"] / record.filename
+        urls = [
+            f"{mirror_root}/{arch}/{repo}/{record.filename}"
+            for mirror_root in candidate_mirrors(mirror)
+        ]
 
         if dry_run:
             print(
@@ -607,14 +691,27 @@ def prepare_packages_for_install(
             download_path.unlink(missing_ok=True)
 
         if force or refresh or not download_path.exists():
-            urls = [
-                f"{mirror_root}/{arch}/{repo}/{record.filename}"
-                for mirror_root in candidate_mirrors(mirror)
-            ]
             print(f"Downloading {c_pkg(record.filename, color_enabled)}")
             used = download_file_with_failover(urls, download_path)
             if used != urls[0]:
                 print_success(f"Mirror failover succeeded via {used}", color_enabled)
+
+        if verify_signature:
+            sig_path = download_path.with_name(f"{download_path.name}.sig")
+            if force:
+                sig_path.unlink(missing_ok=True)
+            if force or refresh or not sig_path.exists():
+                sig_urls = [f"{url}.sig" for url in urls]
+                print(
+                    f"Downloading signature for {c_pkg(record.filename, color_enabled)}"
+                )
+                used_sig = download_file_with_failover(sig_urls, sig_path)
+                if used_sig != sig_urls[0]:
+                    print_success(
+                        f"Signature mirror failover succeeded via {used_sig}",
+                        color_enabled,
+                    )
+            verify_package_signature(download_path, sig_path)
 
         repacked = repack_with_arch_port_force(download_path, dirs["backported"], force)
         validate_repacked_metadata(download_path, repacked, strict_audit)
@@ -715,9 +812,26 @@ def validate_action_flags(args: argparse.Namespace) -> None:
         raise RuntimeError("--dry-run can only be used with --install or --update")
     if not install_update and args.strict_audit:
         raise RuntimeError("--strict-audit can only be used with --install or --update")
+    if not install_update and args.skip_signature_check:
+        raise RuntimeError(
+            "--skip-signature-check can only be used with --install or --update"
+        )
 
     if args.clean and args.refresh:
         raise RuntimeError("--refresh cannot be used with --clean")
+
+
+def handle_doctor(args: argparse.Namespace, color_enabled: bool) -> int:
+    checks = ["pacman", "pacman-key", "vercmp", "curl", "sudo"]
+    missing = [binary for binary in checks if shutil.which(binary) is None]
+    if missing:
+        raise RuntimeError("missing required tools: " + ", ".join(missing))
+
+    validate_repo_arch(args.repo, args.arch)
+    load_index(args.repo, args.arch, args.mirror, True, args.cache_ttl)
+
+    print_success("Doctor checks passed", color_enabled)
+    return 0
 
 
 def handle_list(args: argparse.Namespace, color_enabled: bool) -> int:
@@ -756,6 +870,7 @@ def handle_install(args: argparse.Namespace, color_enabled: bool) -> int:
         args.refresh,
         args.force,
         args.strict_audit,
+        not args.skip_signature_check,
         args.dry_run,
         color_enabled,
     )
@@ -821,6 +936,7 @@ def handle_update(args: argparse.Namespace, color_enabled: bool) -> int:
         args.refresh,
         args.force,
         args.strict_audit,
+        not args.skip_signature_check,
         args.dry_run,
         color_enabled,
     )
@@ -866,6 +982,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     action.add_argument(
         "--clean", action="store_true", help="Remove local cachyport cache data"
+    )
+    action.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run preflight checks for tools, repo access, and configuration",
     )
 
     parser.add_argument(
@@ -928,6 +1049,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --install/--update, compare additional package metadata fields",
     )
     parser.add_argument(
+        "--skip-signature-check",
+        action="store_true",
+        help="With --install/--update, skip detached signature verification",
+    )
+    parser.add_argument(
         "--no-color", action="store_true", help="Disable colored output"
     )
 
@@ -951,6 +1077,8 @@ def main(argv: list[str] | None = None) -> int:
             clear_local_cache()
             print_success("Removed local cache data", color_enabled)
             return 0
+        if args.doctor:
+            return handle_doctor(args, color_enabled)
         raise RuntimeError("no action selected")
     except KeyboardInterrupt:
         print_error("interrupted by user", color_enabled)
