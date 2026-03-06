@@ -21,6 +21,12 @@ from urllib.request import Request, urlopen
 DEFAULT_REPO = "cachyos-v3"
 DEFAULT_ARCH = "x86_64_v3"
 DEFAULT_MIRROR = "https://mirror.cachyos.org/repo"
+FALLBACK_MIRRORS = (
+    "https://cdn77.cachyos.org/repo",
+    "https://cdn.cachyos.org/repo",
+    "https://mirror.cachyos.org/repo",
+    "https://us.cachyos.org/repo",
+)
 CACHE_TTL_SECONDS = 24 * 60 * 60
 SUPPORTED_REPOS = ("cachyos", "cachyos-v3", "cachyos-v4", "cachyos-znver4")
 SUPPORTED_ARCHES = ("x86_64", "x86_64_v3", "x86_64_v4")
@@ -38,6 +44,15 @@ SEMANTIC_PKG_FIELDS = (
     "Provides",
     "Conflicts With",
     "Replaces",
+)
+STRICT_AUDIT_PKG_FIELDS = (
+    "Description",
+    "URL",
+    "Licenses",
+    "Groups",
+    "Packager",
+    "Build Date",
+    "Install Script",
 )
 PACKAGE_METADATA_FILES = {".PKGINFO", ".BUILDINFO"}
 PACKAGE_INTEGRITY_FILES = {".MTREE"}
@@ -155,6 +170,19 @@ def shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def candidate_mirrors(primary: str) -> list[str]:
+    mirrors = [primary, *FALLBACK_MIRRORS]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for mirror in mirrors:
+        value = mirror.rstrip("/")
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
 def run_command(
     command: list[str], capture: bool = False
 ) -> subprocess.CompletedProcess[str]:
@@ -210,6 +238,19 @@ def download_file(url: str, dest: Path) -> None:
         raise RuntimeError(f"failed to download {url}")
 
 
+def download_file_with_failover(urls: list[str], dest: Path) -> str:
+    errors: list[str] = []
+    for url in urls:
+        dest.unlink(missing_ok=True)
+        try:
+            download_file(url, dest)
+            return url
+        except RuntimeError as exc:
+            dest.unlink(missing_ok=True)
+            errors.append(str(exc))
+    raise RuntimeError("all mirrors failed: " + " | ".join(errors))
+
+
 def parse_directory_packages(html: str, base_url: str) -> list[PackageRecord]:
     seen: set[str] = set()
     records: list[PackageRecord] = []
@@ -255,11 +296,25 @@ def load_index(
         except Exception:
             pass
 
-    repo_url = f"{mirror.rstrip('/')}/{arch}/{repo}/"
-    html = fetch_text(repo_url)
-    packages = parse_directory_packages(html, repo_url)
+    packages: list[PackageRecord] = []
+    errors: list[str] = []
+    for mirror_root in candidate_mirrors(mirror):
+        repo_url = f"{mirror_root}/{arch}/{repo}/"
+        try:
+            html = fetch_text(repo_url)
+            packages = parse_directory_packages(html, repo_url)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            continue
+
+        if packages:
+            break
+        errors.append(f"no packages found in repository index: {repo_url}")
+
     if not packages:
-        raise RuntimeError("no packages found in repository index")
+        raise RuntimeError(
+            "unable to load package index from mirrors: " + " | ".join(errors)
+        )
 
     payload = {
         "repo": repo,
@@ -372,7 +427,9 @@ def normalize_field_value(value: str) -> str:
     return "\n".join(parts)
 
 
-def validate_repacked_metadata(original_pkg: Path, repacked_pkg: Path) -> None:
+def validate_repacked_metadata(
+    original_pkg: Path, repacked_pkg: Path, strict_audit: bool
+) -> None:
     if original_pkg == repacked_pkg:
         return
 
@@ -390,8 +447,12 @@ def validate_repacked_metadata(original_pkg: Path, repacked_pkg: Path) -> None:
             f"repacked package architecture is {target_arch}, expected x86_64"
         )
 
+    fields = [*SEMANTIC_PKG_FIELDS]
+    if strict_audit:
+        fields.extend(STRICT_AUDIT_PKG_FIELDS)
+
     differences: list[str] = []
-    for field in SEMANTIC_PKG_FIELDS:
+    for field in fields:
         original_value = normalize_field_value(original.get(field, ""))
         repacked_value = normalize_field_value(repacked.get(field, ""))
         if original_value != repacked_value:
@@ -519,8 +580,13 @@ def resolve_requested_names(
 def prepare_packages_for_install(
     package_names: list[str],
     available: dict[str, PackageRecord],
+    repo: str,
+    arch: str,
+    mirror: str,
     refresh: bool,
     force: bool,
+    strict_audit: bool,
+    dry_run: bool,
     color_enabled: bool,
 ) -> list[Path]:
     dirs = ensure_cache_dirs()
@@ -529,15 +595,29 @@ def prepare_packages_for_install(
     for package_name in package_names:
         record = available[package_name]
         download_path = dirs["downloads"] / record.filename
+
+        if dry_run:
+            print(
+                f"Would prepare {c_pkg(record.filename, color_enabled)} "
+                f"from {mirror}/{arch}/{repo}/"
+            )
+            continue
+
         if force:
             download_path.unlink(missing_ok=True)
 
         if force or refresh or not download_path.exists():
+            urls = [
+                f"{mirror_root}/{arch}/{repo}/{record.filename}"
+                for mirror_root in candidate_mirrors(mirror)
+            ]
             print(f"Downloading {c_pkg(record.filename, color_enabled)}")
-            download_file(record.url, download_path)
+            used = download_file_with_failover(urls, download_path)
+            if used != urls[0]:
+                print_success(f"Mirror failover succeeded via {used}", color_enabled)
 
         repacked = repack_with_arch_port_force(download_path, dirs["backported"], force)
-        validate_repacked_metadata(download_path, repacked)
+        validate_repacked_metadata(download_path, repacked, strict_audit)
         local_paths.append(repacked)
         print_success(f"Ready {repacked.name}", color_enabled)
 
@@ -618,6 +698,28 @@ def ensure_boot_kver_files(package_names: list[str], color_enabled: bool) -> Non
         print_success(f"Created/updated kver files: {joined}", color_enabled)
 
 
+def validate_action_flags(args: argparse.Namespace) -> None:
+    if not args.list and args.installed:
+        raise RuntimeError("--installed can only be used with --list")
+
+    install_update = bool(args.install) or args.update
+    if not install_update and args.assume_yes:
+        raise RuntimeError("--assume-yes can only be used with --install or --update")
+    if not install_update and args.download_only:
+        raise RuntimeError(
+            "--download-only can only be used with --install or --update"
+        )
+    if not install_update and args.force:
+        raise RuntimeError("--force can only be used with --install or --update")
+    if not install_update and args.dry_run:
+        raise RuntimeError("--dry-run can only be used with --install or --update")
+    if not install_update and args.strict_audit:
+        raise RuntimeError("--strict-audit can only be used with --install or --update")
+
+    if args.clean and args.refresh:
+        raise RuntimeError("--refresh cannot be used with --clean")
+
+
 def handle_list(args: argparse.Namespace, color_enabled: bool) -> int:
     records = kernel_packages(
         load_index(args.repo, args.arch, args.mirror, args.refresh, args.cache_ttl)
@@ -646,8 +748,23 @@ def handle_install(args: argparse.Namespace, color_enabled: bool) -> int:
 
     resolved = resolve_requested_names(args.install, available)
     paths = prepare_packages_for_install(
-        resolved, available, args.refresh, args.force, color_enabled
+        resolved,
+        available,
+        args.repo,
+        args.arch,
+        args.mirror,
+        args.refresh,
+        args.force,
+        args.strict_audit,
+        args.dry_run,
+        color_enabled,
     )
+
+    if args.dry_run:
+        print_success(
+            "Dry run complete (no downloads or installs performed)", color_enabled
+        )
+        return 0
 
     if args.download_only:
         print_success("Download/backport complete (skipped install)", color_enabled)
@@ -696,8 +813,23 @@ def handle_update(args: argparse.Namespace, color_enabled: bool) -> int:
         )
 
     paths = prepare_packages_for_install(
-        sorted(update_targets), available, args.refresh, args.force, color_enabled
+        sorted(update_targets),
+        available,
+        args.repo,
+        args.arch,
+        args.mirror,
+        args.refresh,
+        args.force,
+        args.strict_audit,
+        args.dry_run,
+        color_enabled,
     )
+
+    if args.dry_run:
+        print_success(
+            "Dry run complete (no downloads or installs performed)", color_enabled
+        )
+        return 0
     if args.download_only:
         print_success(
             "Update packages downloaded/backported (skipped install)", color_enabled
@@ -786,6 +918,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --install/--update, bypass cached downloads and backported packages",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --install/--update, show planned actions without changes",
+    )
+    parser.add_argument(
+        "--strict-audit",
+        action="store_true",
+        help="With --install/--update, compare additional package metadata fields",
+    )
+    parser.add_argument(
         "--no-color", action="store_true", help="Disable colored output"
     )
 
@@ -798,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
     color_enabled = supports_color(args.no_color)
 
     try:
+        validate_action_flags(args)
         if args.list:
             return handle_list(args, color_enabled)
         if args.install:

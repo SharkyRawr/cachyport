@@ -51,6 +51,8 @@ uv run cachyport --update
 - `--refresh` force refresh repo index cache and redownload packages.
 - `--download-only` perform download + porting without running `pacman -U`.
 - `--force` with `--install`/`--update` bypasses cached downloads and backported packages.
+- `--dry-run` with `--install`/`--update` prints planned actions without changing files or packages.
+- `--strict-audit` with `--install`/`--update` compares additional package metadata fields during repack validation.
 - `--clean` removes local `cachyport` cache data (`~/.cache/cachyport`).
 - `--assume-yes` pass `--noconfirm` to `pacman`.
 - `--no-color` disable ANSI colors.
@@ -74,5 +76,7 @@ Use `--refresh` to rebuild cache immediately.
 - `--update` checks installed `linux-cachyos*` packages and packages previously installed via `cachyport --install`.
 - Repo/arch combinations are validated (`cachyos->x86_64`, `cachyos-v3->x86_64_v3`, `cachyos-v4->x86_64_v4`, `cachyos-znver4->x86_64_v4`).
 - Repacked packages are verified with `pacman -Qip` to ensure semantic fields (depends/provides/conflicts/replaces/optional deps) are unchanged.
+- `--strict-audit` extends repack validation to extra fields (description, URL, licenses, groups, packager, build date, install script).
 - Repacking removes upstream `.MTREE` from the local ported package to avoid stale integrity metadata after arch rewrite.
 - After install/update, `cachyport` ensures `/boot/<pkgbase>.kver` exists for installed kernel packages.
+- Index and downloads use mirror failover automatically (`--mirror` first, then built-in fallbacks).
