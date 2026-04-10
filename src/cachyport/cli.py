@@ -866,6 +866,8 @@ def ensure_boot_kver_files(package_names: list[str], color_enabled: bool) -> Non
     if updates:
         joined = ", ".join(sorted(set(updates)))
         print_success(f"Created/updated kver files: {joined}", color_enabled)
+        if shutil.which("update-grub") is not None:
+            run_command(["sudo", "update-grub"])
 
 
 def validate_action_flags(args: argparse.Namespace) -> None:
